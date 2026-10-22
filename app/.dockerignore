@@ -1,0 +1,9 @@
+tests/
+events/
+__pycache__/
+*.pyc
+.pytest_cache/
+requirements-dev.txt
+Makefile
+README.md
+dev_server.py
