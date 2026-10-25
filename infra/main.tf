@@ -40,15 +40,15 @@ module "iam" {
 }
 
 module "serving" {
-  source          = "./modules/serving"
-  prefix          = local.prefix
-  function_name   = local.function_name
-  role_arn        = module.iam.lambda_role_arn
-  image_uri       = var.image_uri != "" ? var.image_uri : "${module.registry.repository_url}:placeholder"
-  memory_mb       = var.lambda_memory_mb
-  timeout_s       = var.lambda_timeout_s
-  log_group_name  = module.monitoring.log_group_name
-  cors_origins    = concat(["http://${module.storage.frontend_website_endpoint}"], var.extra_cors_origins)
+  source         = "./modules/serving"
+  prefix         = local.prefix
+  function_name  = local.function_name
+  role_arn       = module.iam.lambda_role_arn
+  image_uri      = var.image_uri != "" ? var.image_uri : "${module.registry.repository_url}:placeholder"
+  memory_mb      = var.lambda_memory_mb
+  timeout_s      = var.lambda_timeout_s
+  log_group_name = module.monitoring.log_group_name
+  cors_origins   = concat(["http://${module.storage.frontend_website_endpoint}"], var.extra_cors_origins)
 
   # Lambda environment variables (contract section 4)
   predictions_table = module.database.table_name
