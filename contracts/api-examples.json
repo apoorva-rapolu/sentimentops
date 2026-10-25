@@ -1,0 +1,51 @@
+{
+  "predict_ok": {
+    "request": {
+      "method": "POST",
+      "path": "/predict",
+      "body": { "text": "The deployment pipeline worked perfectly, I love it!" }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "request_id": "3f2b8c1e-6d4a-4b7f-9c2e-1a5d7e9f0b23",
+        "label": "POSITIVE",
+        "score": 0.8655,
+        "model_version": "vader-1.0",
+        "latency_ms": 2
+      }
+    }
+  },
+  "predict_neutral": {
+    "request": {
+      "method": "POST",
+      "path": "/predict",
+      "body": { "text": "The meeting is at 3 pm in room 204." }
+    },
+    "response": {
+      "status": 200,
+      "body": {
+        "request_id": "a91c0d44-2e7b-4f1a-8b3c-5d6e7f8a9b0c",
+        "label": "NEUTRAL",
+        "score": 1.0,
+        "model_version": "vader-1.0",
+        "latency_ms": 1
+      }
+    }
+  },
+  "predict_empty_text": {
+    "request": { "method": "POST", "path": "/predict", "body": { "text": "" } },
+    "response": { "status": 400, "body": { "error": "\"text\" must not be empty." } }
+  },
+  "predict_missing_field": {
+    "request": { "method": "POST", "path": "/predict", "body": { "message": "hi" } },
+    "response": {
+      "status": 400,
+      "body": { "error": "Request body must be a JSON object with a \"text\" field." }
+    }
+  },
+  "health_ok": {
+    "request": { "method": "GET", "path": "/health" },
+    "response": { "status": 200, "body": { "status": "ok", "model_version": "vader-1.0" } }
+  }
+}
