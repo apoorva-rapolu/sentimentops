@@ -1,0 +1,146 @@
+name: Infrastructure (Terraform)
+
+# PR touching infra/  -> fmt + validate + plan (read-only role, nothing is changed)
+# merge to main       -> plan + apply, only after a reviewer approves the "infra-apply" environment
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - "orchestration/**"
+      - ".github/workflows/infra.yml"
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "orchestration/**"
+      - ".github/workflows/infra.yml"
+
+permissions:
+  contents: read
+
+env:
+  # Terraform root = infra/ according to the team contract layout. Confirm with Shaurya.
+  TF_ROOT: infra
+  TF_VERSION: "1.9.8"
+  # Optional extra flags, e.g. "-backend-config=backend.hcl" if Shaurya uses partial backend config.
+  TF_INIT_ARGS: ${{ vars.TF_INIT_ARGS }}
+
+jobs:
+  plan:
+    name: Validate and plan
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      id-token: write   # needed to request the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there Terraform to plan?
+        id: tf
+        run: |
+          if find "$TF_ROOT" -maxdepth 1 -name '*.tf' 2>/dev/null | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No .tf files in $TF_ROOT/ - nothing to plan."
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.tf.outputs.present == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        if: steps.tf.outputs.present == 'true'
+        run: terraform fmt -check -recursive -diff "$TF_ROOT"
+
+      - name: Configure AWS credentials (OIDC, read-only plan role)
+        if: steps.tf.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        if: steps.tf.outputs.present == 'true'
+        # TF_INIT_ARGS is intentionally unquoted so several flags can be passed.
+        run: terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
+
+      - name: terraform validate
+        if: steps.tf.outputs.present == 'true'
+        run: terraform -chdir="$TF_ROOT" validate -no-color
+
+      - name: terraform plan
+        if: steps.tf.outputs.present == 'true'
+        # -lock=false: the plan role is read-only and a PR plan must not block a real apply.
+        run: terraform -chdir="$TF_ROOT" plan -input=false -no-color -lock=false -out=tfplan
+
+      - name: Show plan summary
+        if: steps.tf.outputs.present == 'true'
+        run: |
+          {
+            echo '### Terraform plan'
+            echo '```'
+            terraform -chdir="$TF_ROOT" show -no-color tfplan | head -c 60000
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Plan and apply (needs approval)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The reviewers configured on this environment must approve before the job starts.
+    # It also sets the OIDC "sub" claim that the apply role trusts.
+    environment: infra-apply
+    concurrency:
+      group: terraform-apply
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is there Terraform to apply?
+        id: tf
+        run: |
+          if find "$TF_ROOT" -maxdepth 1 -name '*.tf' 2>/dev/null | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No .tf files in $TF_ROOT/ - nothing to apply."
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.tf.outputs.present == 'true'
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials (OIDC, apply role)
+        if: steps.tf.outputs.present == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_INFRA_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: terraform init
+        if: steps.tf.outputs.present == 'true'
+        run: terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
+
+      - name: terraform validate
+        if: steps.tf.outputs.present == 'true'
+        run: terraform -chdir="$TF_ROOT" validate -no-color
+
+      - name: terraform plan
+        if: steps.tf.outputs.present == 'true'
+        run: terraform -chdir="$TF_ROOT" plan -input=false -no-color -out=tfplan
+
+      - name: terraform apply (exactly the plan above)
+        if: steps.tf.outputs.present == 'true'
+        # Output is not printed: apply logs resource changes only. Never add `terraform output` here.
+        run: terraform -chdir="$TF_ROOT" apply -input=false -no-color tfplan

@@ -1,0 +1,336 @@
+{
+  "Comment": "SentimentOps deployment: validate input -> update Lambda image -> wait -> smoke test -> succeed, or roll back to previous_image_uri. ${lambda_function_name} is filled in by Terraform templatefile() in infra/modules/pipeline/main.tf.",
+  "StartAt": "ValidateInput",
+  "TimeoutSeconds": 1800,
+  "States": {
+    "ValidateInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.image_uri", "IsPresent": true },
+            { "Variable": "$.image_uri", "IsString": true },
+            { "Not": { "Variable": "$.image_uri", "StringEquals": "" } },
+            { "Variable": "$.commit_sha", "IsPresent": true },
+            { "Variable": "$.commit_sha", "IsString": true },
+            { "Not": { "Variable": "$.commit_sha", "StringEquals": "" } }
+          ],
+          "Next": "Init"
+        }
+      ],
+      "Default": "InvalidInput"
+    },
+    "InvalidInput": {
+      "Type": "Fail",
+      "Error": "InvalidInput",
+      "Cause": "Execution input must contain non-empty image_uri and commit_sha. previous_image_uri is optional but needed for rollback."
+    },
+    "Init": {
+      "Type": "Pass",
+      "Result": { "phase": "deploy", "polls": 0 },
+      "ResultPath": "$.state",
+      "Next": "UpdateFunction"
+    },
+    "UpdateFunction": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:lambda:updateFunctionCode",
+      "Parameters": {
+        "FunctionName": "${lambda_function_name}",
+        "ImageUri.$": "$.image_uri"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ResourceConflictException", "Lambda.TooManyRequestsException", "Lambda.ServiceException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 6,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CanRollback" }
+      ],
+      "Next": "WaitForUpdate"
+    },
+    "WaitForUpdate": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "GetUpdateStatus"
+    },
+    "GetUpdateStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:lambda:getFunctionConfiguration",
+      "Parameters": { "FunctionName": "${lambda_function_name}" },
+      "ResultSelector": { "LastUpdateStatus.$": "$.LastUpdateStatus" },
+      "ResultPath": "$.status",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 4,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CanRollback" }
+      ],
+      "Next": "CheckUpdateStatus"
+    },
+    "CheckUpdateStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.status.LastUpdateStatus", "StringEquals": "Successful" },
+            { "Variable": "$.state.phase", "StringEquals": "deploy" }
+          ],
+          "Next": "SmokeHealth"
+        },
+        {
+          "And": [
+            { "Variable": "$.status.LastUpdateStatus", "StringEquals": "Successful" },
+            { "Variable": "$.state.phase", "StringEquals": "rollback" }
+          ],
+          "Next": "RolledBack"
+        },
+        {
+          "And": [
+            { "Variable": "$.status.LastUpdateStatus", "StringEquals": "Failed" },
+            { "Variable": "$.state.phase", "StringEquals": "rollback" }
+          ],
+          "Next": "RollbackFailed"
+        },
+        {
+          "Variable": "$.status.LastUpdateStatus",
+          "StringEquals": "Failed",
+          "Next": "CanRollback"
+        },
+        {
+          "And": [
+            { "Variable": "$.state.polls", "NumericGreaterThanEquals": 60 },
+            { "Variable": "$.state.phase", "StringEquals": "rollback" }
+          ],
+          "Next": "RollbackFailed"
+        },
+        {
+          "Variable": "$.state.polls",
+          "NumericGreaterThanEquals": 60,
+          "Next": "CanRollback"
+        }
+      ],
+      "Default": "CountPoll"
+    },
+    "CountPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "phase.$": "$.state.phase",
+        "polls.$": "States.MathAdd($.state.polls, 1)"
+      },
+      "ResultPath": "$.state",
+      "Next": "WaitForUpdate"
+    },
+    "SmokeHealth": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_function_name}",
+        "Payload": {
+          "httpMethod": "GET",
+          "path": "/health",
+          "headers": {},
+          "body": null,
+          "isBase64Encoded": false
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "States.StringToJson($.Payload.body)"
+      },
+      "ResultPath": "$.smoke_health",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CanRollback" }
+      ],
+      "Next": "CheckHealth"
+    },
+    "CheckHealth": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.smoke_health.statusCode", "NumericEquals": 200 },
+            { "Variable": "$.smoke_health.body.status", "IsPresent": true },
+            { "Variable": "$.smoke_health.body.status", "StringEquals": "ok" }
+          ],
+          "Next": "SmokePredict"
+        }
+      ],
+      "Default": "CanRollback"
+    },
+    "SmokePredict": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_function_name}",
+        "Payload": {
+          "httpMethod": "POST",
+          "path": "/predict",
+          "headers": { "Content-Type": "application/json" },
+          "body": "{\"text\": \"I really enjoyed this product.\"}",
+          "isBase64Encoded": false
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "States.StringToJson($.Payload.body)"
+      },
+      "ResultPath": "$.smoke_predict",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CanRollback" }
+      ],
+      "Next": "CheckPredict"
+    },
+    "CheckPredict": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.smoke_predict.statusCode", "NumericEquals": 200 },
+            { "Variable": "$.smoke_predict.body.label", "IsPresent": true },
+            {
+              "Or": [
+                { "Variable": "$.smoke_predict.body.label", "StringEquals": "POSITIVE" },
+                { "Variable": "$.smoke_predict.body.label", "StringEquals": "NEGATIVE" },
+                { "Variable": "$.smoke_predict.body.label", "StringEquals": "NEUTRAL" }
+              ]
+            },
+            { "Variable": "$.smoke_predict.body.score", "IsPresent": true },
+            { "Variable": "$.smoke_predict.body.score", "IsNumeric": true },
+            { "Variable": "$.smoke_predict.body.score", "NumericGreaterThanEquals": 0 },
+            { "Variable": "$.smoke_predict.body.score", "NumericLessThanEquals": 1 }
+          ],
+          "Next": "SmokeBadInput"
+        }
+      ],
+      "Default": "CanRollback"
+    },
+    "SmokeBadInput": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${lambda_function_name}",
+        "Payload": {
+          "httpMethod": "POST",
+          "path": "/predict",
+          "headers": { "Content-Type": "application/json" },
+          "body": "{\"text\": \"\"}",
+          "isBase64Encoded": false
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "States.StringToJson($.Payload.body)"
+      },
+      "ResultPath": "$.smoke_bad_input",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CanRollback" }
+      ],
+      "Next": "CheckBadInput"
+    },
+    "CheckBadInput": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.smoke_bad_input.statusCode", "NumericEquals": 400 },
+            { "Variable": "$.smoke_bad_input.body.error", "IsPresent": true }
+          ],
+          "Next": "DeploymentSucceeded"
+        }
+      ],
+      "Default": "CanRollback"
+    },
+    "DeploymentSucceeded": {
+      "Type": "Succeed"
+    },
+    "CanRollback": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.previous_image_uri", "IsPresent": true },
+            { "Variable": "$.previous_image_uri", "IsString": true },
+            { "Not": { "Variable": "$.previous_image_uri", "StringEquals": "" } }
+          ],
+          "Next": "RollbackStart"
+        }
+      ],
+      "Default": "NoRollbackAvailable"
+    },
+    "NoRollbackAvailable": {
+      "Type": "Fail",
+      "Error": "DeploymentFailedNoRollback",
+      "Cause": "The new image failed deployment or verification and no previous_image_uri was supplied. The Lambda function was NOT rolled back and may still be running the new image. Inspect the failing state in the execution history."
+    },
+    "RollbackStart": {
+      "Type": "Pass",
+      "Result": { "phase": "rollback", "polls": 0 },
+      "ResultPath": "$.state",
+      "Next": "RollbackUpdate"
+    },
+    "RollbackUpdate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:lambda:updateFunctionCode",
+      "Parameters": {
+        "FunctionName": "${lambda_function_name}",
+        "ImageUri.$": "$.previous_image_uri"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ResourceConflictException", "Lambda.TooManyRequestsException", "Lambda.ServiceException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 8,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.rollback_error", "Next": "RollbackFailed" }
+      ],
+      "Next": "WaitForUpdate"
+    },
+    "RolledBack": {
+      "Type": "Fail",
+      "Error": "DeploymentRolledBack",
+      "Cause": "The new image failed deployment or verification. Lambda was restored to previous_image_uri. The deployment did NOT succeed; check the execution history for the failing state."
+    },
+    "RollbackFailed": {
+      "Type": "Fail",
+      "Error": "RollbackFailed",
+      "Cause": "Deployment failed AND the rollback to previous_image_uri also failed. Lambda may be in a broken state; fix manually (aws lambda update-function-code with a known-good image)."
+    }
+  }
+}

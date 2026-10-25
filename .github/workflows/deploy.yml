@@ -1,0 +1,156 @@
+name: Deploy
+
+# push to main -> tests, build image, push to ECR, run the Step Functions deployment,
+# run smoke tests against the live API, then sync the frontend to S3.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "frontend/**"
+      - "orchestration/**"
+      - "tests/smoke/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false   # never cancel a deployment half way
+
+jobs:
+  test:
+    name: Application tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r app/requirements-dev.txt
+      - run: python -m pytest -q app/tests
+
+  deploy:
+    name: Build, deploy, verify
+    needs: test
+    if: github.ref == 'refs/heads/main'   # also blocks workflow_dispatch from other branches
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      # All values come from GitHub repository variables (copied from `terraform output`).
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY_URL: ${{ vars.ECR_REPOSITORY_URL }}
+      LAMBDA_FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      STATE_MACHINE_ARN: ${{ vars.STATE_MACHINE_ARN }}
+      FRONTEND_BUCKET_NAME: ${{ vars.FRONTEND_BUCKET_NAME }}
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required repository variables
+        env:
+          ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          missing=0
+          for name in AWS_REGION ECR_REPOSITORY_URL LAMBDA_FUNCTION_NAME STATE_MACHINE_ARN FRONTEND_BUCKET_NAME API_BASE_URL; do
+            if [ -z "${!name}" ]; then echo "::error::Repository variable $name is not set"; missing=1; fi
+          done
+          if [ -z "$ROLE_ARN" ]; then echo "::error::Repository variable AWS_DEPLOY_ROLE_ARN is not set"; missing=1; fi
+          exit $missing
+
+      - name: Configure AWS credentials (OIDC, deploy role)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Remember the image Lambda runs today (for rollback)
+        id: previous
+        run: |
+          prev=$(aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" \
+                   --query 'Code.ResolvedImageUri || Code.ImageUri' --output text)
+          if [ "$prev" = "None" ]; then prev=""; fi
+          echo "previous_image_uri=$prev" >> "$GITHUB_OUTPUT"
+          if [ -z "$prev" ]; then echo "::warning::No previous image found - rollback will not be possible."; fi
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image (linux/amd64, tagged with the commit SHA)
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          platforms: linux/amd64
+          push: true
+          provenance: false   # Lambda cannot run the multi-manifest images buildx makes by default
+          sbom: false
+          tags: |
+            ${{ env.ECR_REPOSITORY_URL }}:${{ github.sha }}
+            ${{ env.ECR_REPOSITORY_URL }}:latest
+
+      - name: Start the Step Functions deployment
+        id: sfn
+        run: |
+          input=$(jq -nc \
+            --arg image_uri "${ECR_REPOSITORY_URL}:${GITHUB_SHA}" \
+            --arg commit_sha "$GITHUB_SHA" \
+            --arg previous_image_uri "${{ steps.previous.outputs.previous_image_uri }}" \
+            '{image_uri: $image_uri, commit_sha: $commit_sha, previous_image_uri: $previous_image_uri}')
+          arn=$(aws stepfunctions start-execution \
+                  --state-machine-arn "$STATE_MACHINE_ARN" \
+                  --name "deploy-${GITHUB_SHA::12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+                  --input "$input" --query executionArn --output text)
+          echo "execution_arn=$arn" >> "$GITHUB_OUTPUT"
+          echo "Started $arn"
+
+      - name: Wait for the deployment result
+        env:
+          EXECUTION_ARN: ${{ steps.sfn.outputs.execution_arn }}
+        run: |
+          for i in $(seq 1 90); do   # up to 15 minutes
+            status=$(aws stepfunctions describe-execution --execution-arn "$EXECUTION_ARN" --query status --output text)
+            echo "[$i] $status"
+            case "$status" in
+              SUCCEEDED)
+                echo "### Deployed ${GITHUB_SHA::12}" >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+              FAILED|TIMED_OUT|ABORTED)
+                aws stepfunctions describe-execution --execution-arn "$EXECUTION_ARN" \
+                  --query '{status:status,error:error,cause:cause}' --output json | tee -a "$GITHUB_STEP_SUMMARY"
+                aws stepfunctions get-execution-history --execution-arn "$EXECUTION_ARN" --reverse-order --max-items 15 \
+                  --query "events[].{id:id,type:type}" --output table || true
+                echo "::error::Deployment $status. The error above says whether Lambda was rolled back (DeploymentRolledBack), could not be (DeploymentFailedNoRollback) or the rollback failed (RollbackFailed)."
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Timed out waiting for the Step Functions execution"
+          exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: tests/smoke/requirements.txt
+
+      - name: Smoke tests against the live API
+        run: |
+          pip install -r tests/smoke/requirements.txt
+          python -m pytest -v tests/smoke
+
+      - name: Deploy frontend to S3
+        run: |
+          # Written into the runner's workspace only; nothing is committed.
+          printf 'window.SENTIMENTOPS_CONFIG = { API_BASE_URL: "%s" };\n' "${API_BASE_URL%/}" > frontend/config.js
+          aws s3 sync frontend/ "s3://${FRONTEND_BUCKET_NAME}" \
+            --exclude "README.md" --delete --cache-control "no-cache"
