@@ -1,0 +1,126 @@
+name: CI
+
+# Runs on every pull request and on pushes to main. No AWS credentials, no deploys.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  app:
+    name: App tests, lint, smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # same as the Lambda base image
+          cache: pip
+          cache-dependency-path: |
+            app/requirements-dev.txt
+            tests/smoke/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements-dev.txt
+          pip install -r tests/smoke/requirements.txt "ruff>=0.6,<1"
+
+      - name: Lint (syntax errors and undefined names)
+        run: ruff check --select E9,F app tests orchestration
+
+      - name: Unit tests (app/tests, DynamoDB mocked with moto)
+        run: python -m pytest -q app/tests
+
+      - name: Smoke tests against the local dev server
+        # Proves the smoke tests themselves work, before they are used on AWS.
+        run: |
+          python app/dev_server.py &
+          i=1
+          while [ "$i" -le 20 ]; do
+            curl -fs http://localhost:8000/health >/dev/null && break
+            sleep 1
+            i=$((i + 1))
+          done
+          API_BASE_URL=http://localhost:8000 python -m pytest -q tests/smoke
+
+  docker:
+    name: Docker image builds and answers
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the Lambda image (linux/amd64)
+        run: docker build --platform linux/amd64 -t sentimentops-app:ci app/
+
+      - name: Invoke the container with the Lambda Runtime Interface Emulator
+        run: |
+          docker run -d --name sut -p 9000:8080 -e MODEL_VERSION=vader-ci sentimentops-app:ci
+          URL=http://localhost:9000/2015-03-31/functions/function/invocations
+          i=1
+          while [ "$i" -le 15 ]; do
+            curl -fs "$URL" -d @app/events/health.json >/tmp/health.json && break
+            sleep 2
+            i=$((i + 1))
+          done
+          cat /tmp/health.json; echo
+          test "$(jq -r .statusCode /tmp/health.json)" = "200"
+          curl -fs "$URL" -d @app/events/predict.json | jq -e '.statusCode == 200'
+          curl -fs "$URL" -d @app/events/bad_request.json | jq -e '.statusCode == 400'
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs sut || true
+
+  config:
+    name: Workflows, state machine, Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+      - name: Validate Step Functions definition
+        run: python orchestration/validate_asl.py orchestration/state_machine.asl.json
+
+      - name: Does infra/ exist yet?
+        id: tf
+        run: |
+          if find infra -name '*.tf' 2>/dev/null | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Terraform files under infra/ yet - skipping Terraform checks."
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.tf.outputs.present == 'true'
+        with:
+          terraform_version: "1.9.8"   # confirm with Shaurya
+
+      - name: terraform fmt -check
+        if: steps.tf.outputs.present == 'true'
+        run: terraform fmt -check -recursive -diff infra
+
+      - name: terraform validate (every directory containing .tf files, no backend)
+        if: steps.tf.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r dir; do
+            echo "::group::validate $dir"
+            terraform -chdir="$dir" init -backend=false -input=false -no-color >/dev/null
+            terraform -chdir="$dir" validate -no-color
+            echo "::endgroup::"
+          done < <(find infra -name '*.tf' -not -path '*/.terraform/*' -printf '%h\n' | sort -u)
