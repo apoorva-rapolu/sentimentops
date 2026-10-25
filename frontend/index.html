@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SentimentOps</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="wrap">
+    <header class="top">
+      <div>
+        <h1>SentimentOps</h1>
+        <p class="sub">Real-time sentiment analysis, served from AWS Lambda</p>
+      </div>
+      <div class="status" id="status" title="API health">
+        <span class="dot"></span><span id="status-text">Checking API…</span>
+      </div>
+    </header>
+
+    <section class="card">
+      <label for="text" class="label">Text to analyse</label>
+      <textarea id="text" rows="5" maxlength="1000"
+        placeholder="Type a sentence, e.g. “The new release is fantastic!”"></textarea>
+      <div class="row">
+        <span class="count"><span id="count">0</span> / 1000</span>
+        <button id="analyse" type="button">Analyse</button>
+      </div>
+      <div class="examples">
+        <span>Try:</span>
+        <button class="chip" type="button">I absolutely love this product!</button>
+        <button class="chip" type="button">The service was slow and disappointing.</button>
+        <button class="chip" type="button">The parcel arrives on Tuesday.</button>
+      </div>
+    </section>
+
+    <section class="card result" id="result" hidden>
+      <div class="result-head">
+        <span class="badge" id="label">—</span>
+        <span class="score"><strong id="score">—</strong> strength</span>
+      </div>
+      <div class="bar"><div class="fill" id="bar"></div></div>
+      <dl class="meta">
+        <div><dt>Latency</dt><dd id="latency">—</dd></div>
+        <div><dt>Model</dt><dd id="model">—</dd></div>
+        <div><dt>Request ID</dt><dd id="request-id">—</dd></div>
+      </dl>
+    </section>
+
+    <p class="error" id="error" role="alert" hidden></p>
+
+    <section class="card history" id="history-card" hidden>
+      <h2>This session</h2>
+      <ul id="history"></ul>
+    </section>
+
+    <footer class="foot" id="mode"></footer>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
