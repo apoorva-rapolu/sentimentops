@@ -66,9 +66,10 @@ jobs:
 
       - name: terraform init
         if: steps.tf.outputs.present == 'true'
-        # TF_INIT_ARGS is intentionally unquoted so several flags can be passed.
-        # shellcheck disable=SC2086
-        run: terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
+                # TF_INIT_ARGS is intentionally unquoted so several flags can be passed.
+        run: |
+          # shellcheck disable=SC2086
+          terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
 
       - name: terraform validate
         if: steps.tf.outputs.present == 'true'
@@ -131,9 +132,9 @@ jobs:
 
       - name: terraform init
         if: steps.tf.outputs.present == 'true'
-        # TF_INIT_ARGS is intentionally unquoted so several flags can be passed.
-        # shellcheck disable=SC2086
-        run: terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
+        run: |
+          # shellcheck disable=SC2086
+          terraform -chdir="$TF_ROOT" init -input=false -no-color $TF_INIT_ARGS
 
       - name: terraform validate
         if: steps.tf.outputs.present == 'true'
