@@ -1,3 +1,7 @@
+import os
+
+import requests
+
 from conftest import parse_json
 
 
@@ -16,6 +20,10 @@ def test_health_body_shape(api):
 
 
 def test_cors_header_present(api):
-    res = api.get("/health")
-    assert "Access-Control-Allow-Origin" in res.headers, \
-        "CORS header Access-Control-Allow-Origin missing (the frontend on S3 would be blocked)"
+    # Act like the browser: API Gateway (HTTP API with CORS configured) only adds the
+    # CORS header when the request carries an Origin header that it allows.
+    origin = os.environ.get("SMOKE_ORIGIN", "http://localhost:8080")
+    res = requests.get(f"{api.base_url}/health", headers={"Origin": origin}, timeout=30)
+    allowed = res.headers.get("Access-Control-Allow-Origin")
+    assert allowed in (origin, "*"), \
+        f"CORS: Origin {origin!r} got Access-Control-Allow-Origin={allowed!r} (the frontend would be blocked)"

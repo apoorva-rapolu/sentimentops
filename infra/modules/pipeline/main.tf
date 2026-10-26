@@ -26,6 +26,15 @@ locals {
   oidc_host         = "token.actions.githubusercontent.com"
   oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github[0].arn
 
+  # GitHub OIDC "sub" claims come in two formats (GitHub changed it for new repos on 2026-07-15):
+  #   classic: repo:<owner>/<repo>:...
+  #   new:     repo:<owner>@<owner-id>/<repo>@<repo-id>:...
+  # Trust policies accept both. The IDs are wildcarded under StringLike.
+  gh_owner      = split("/", var.github_repository)[0]
+  gh_repo       = split("/", var.github_repository)[1]
+  sub_classic   = "repo:${var.github_repository}"
+  sub_immutable = "repo:${local.gh_owner}@*/${local.gh_repo}@*"
+
   state_machine_name = "${local.prefix}-deploy"
   state_machine_arn  = "arn:${local.partition}:states:${local.region}:${local.account_id}:stateMachine:${local.state_machine_name}"
   execution_arn      = "arn:${local.partition}:states:${local.region}:${local.account_id}:execution:${local.state_machine_name}:*"
@@ -64,9 +73,9 @@ data "aws_iam_policy_document" "trust_deploy" {
       values   = ["sts.amazonaws.com"]
     }
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "${local.oidc_host}:sub"
-      values   = ["repo:${var.github_repository}:ref:refs/heads/${var.deploy_branch}"]
+      values   = ["${local.sub_classic}:ref:refs/heads/${var.deploy_branch}", "${local.sub_immutable}:ref:refs/heads/${var.deploy_branch}"]
     }
   }
 }
@@ -84,9 +93,9 @@ data "aws_iam_policy_document" "trust_infra_plan" {
       values   = ["sts.amazonaws.com"]
     }
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "${local.oidc_host}:sub"
-      values   = ["repo:${var.github_repository}:pull_request"]
+      values   = ["${local.sub_classic}:pull_request", "${local.sub_immutable}:pull_request"]
     }
   }
 }
@@ -106,9 +115,9 @@ data "aws_iam_policy_document" "trust_infra_apply" {
     # Jobs that use a GitHub Environment get this "sub". Restrict the environment to
     # the main branch in GitHub (Settings > Environments > Deployment branches).
     condition {
-      test     = "StringEquals"
+      test     = "StringLike"
       variable = "${local.oidc_host}:sub"
-      values   = ["repo:${var.github_repository}:environment:${var.infra_apply_environment}"]
+      values   = ["${local.sub_classic}:environment:${var.infra_apply_environment}", "${local.sub_immutable}:environment:${var.infra_apply_environment}"]
     }
   }
 }
