@@ -19,8 +19,12 @@ output "frontend_bucket_name" {
   value       = module.storage.frontend_bucket_name
 }
 
-# state_machine_arn and github_actions_role_arn are outputs of Manik's pipeline
-# module. See pipeline.tf; enable it once infra/modules/pipeline/ is merged.
+# state_machine_arn and github_actions_role_arn: see pipeline.tf.
+
+output "frontend_url" {
+  description = "Public URL of the demo frontend (contract section 7)"
+  value       = "http://${module.storage.frontend_website_endpoint}"
+}
 
 # ---- Extras (handy for demo / debugging) ----
 output "frontend_website_url" {
