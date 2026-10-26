@@ -145,6 +145,8 @@ jobs:
 
       - name: Smoke tests against the live API
         run: |
+          # The CORS test sends the real frontend's Origin, as a browser would.
+          export SMOKE_ORIGIN="http://${FRONTEND_BUCKET_NAME}.s3-website.${AWS_REGION}.amazonaws.com"
           pip install -r tests/smoke/requirements.txt
           python -m pytest -v tests/smoke
 
