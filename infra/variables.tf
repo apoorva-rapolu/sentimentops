@@ -37,7 +37,7 @@ variable "lambda_timeout_s" {
 variable "extra_cors_origins" {
   description = "Extra origins allowed by the API (local frontend dev)."
   type        = list(string)
-  default     = ["http://localhost:8000", "http://localhost:5500", "http://127.0.0.1:5500"]
+  default     = ["http://localhost:8000", "http://localhost:8080", "http://localhost:5500", "http://127.0.0.1:5500"]
 }
 
 variable "alarm_email" {
